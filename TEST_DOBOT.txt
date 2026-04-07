@@ -1,188 +1,85 @@
 #!/usr/bin/env python3
 """
-DOBOT AUTO-RECOVERY - 100% AUTOMATIQUE - VERSION CORRIGÉE
+DOBOT HARD RESET - Reset matériel complet
 """
 
 from pydobot import Dobot
 import time
-import serial
+import subprocess
 import sys
 
 PORT = '/dev/ttyUSB0'
 
-class DobotAutoRecovery:
-    def __init__(self):
-        self.dobot = None
-        self.current_pos = (0, 0, 0, 0, 0, 0, 0, 0)  # 8 valeurs retournées par pose()
-        
-    def connect(self):
-        """Connexion au Dobot"""
-        try:
-            self.dobot = Dobot(port=PORT, verbose=False)
-            pose = self.dobot.pose()
-            self.current_pos = pose  # Stocker tout le tuple
-            print(f"✅ Connecté: X={pose[0]:.1f}, Y={pose[1]:.1f}, Z={pose[2]:.1f}, R={pose[3]:.1f}")
-            return True
-        except Exception as e:
-            print(f"❌ Connexion échouée: {e}")
-            return False
+def usb_power_cycle():
+    """Coupe et restaure l'alimentation USB"""
+    print("🔌 Cycle d'alimentation USB...")
     
-    def is_in_red_zone(self):
-        """Détecte si le robot est en zone rouge (bloqué)"""
-        pose = self.current_pos
-        x, y, z = pose[0], pose[1], pose[2]  # Seulement X, Y, Z
+    try:
+        # Trouver le port USB du Dobot
+        result = subprocess.run(['lsusb'], capture_output=True, text=True)
+        print(result.stdout)
         
-        # Zones rouges = positions extrêmes qui bloquent le robot
-        if y < -180 or y > 180:
-            return True, f"Y={y:.1f} hors limite (zone rouge)"
-        if x < 90 or x > 310:
-            return True, f"X={x:.1f} hors limite (zone rouge)"
-        if z < 80 or z > 220:
-            return True, f"Z={z:.1f} hors limite (zone rouge)"
-        return False, "OK"
-    
-    def micro_move(self, dx, dy, dz, dr, max_retries=3):
-        """Micro-mouvement avec tentatives multiples"""
-        for attempt in range(max_retries):
-            try:
-                pose = self.current_pos
-                x, y, z, r = pose[0], pose[1], pose[2], pose[3]
-                new_x = x + dx
-                new_y = y + dy
-                new_z = z + dz
-                new_r = r + dr
-                
-                print(f"   → Micro-mouvement: ({dx:+.0f},{dy:+.0f},{dz:+.0f},{dr:+.0f})")
-                self.dobot.move_to(new_x, new_y, new_z, new_r, wait=True)
-                time.sleep(0.3)
-                
-                # Mettre à jour position
-                self.current_pos = self.dobot.pose()
-                print(f"      Nouvelle position: X={self.current_pos[0]:.1f}, Y={self.current_pos[1]:.1f}")
-                return True
-            except Exception as e:
-                print(f"   ⚠️ Tentative {attempt+1} échouée: {e}")
-                time.sleep(0.5)
+        # Méthode 1: Déconnecter/reconnecter via sysfs
+        subprocess.run(['sudo', 'sh', '-c', 'echo 0 > /sys/bus/usb/devices/usb1/authorized'], capture_output=True)
+        time.sleep(2)
+        subprocess.run(['sudo', 'sh', '-c', 'echo 1 > /sys/bus/usb/devices/usb1/authorized'], capture_output=True)
+        time.sleep(3)
+        
+        print("✅ Cycle USB terminé")
+        return True
+    except Exception as e:
+        print(f"❌ Échec cycle USB: {e}")
         return False
-    
-    def emergency_unlock_sequence(self):
-        """Séquence de déblocage d'urgence (100% automatique)"""
-        print("🔄 DÉBLOCAGE AUTOMATIQUE...")
-        
-        # Séquence de micro-mouvements pour sortir de la butée
-        sequences = [
-            (0, 0, 15, 0),    # Monter
-            (0, 0, -10, 0),   # Redescendre
-            (15, 0, 0, 0),    # Avancer X
-            (-15, 0, 0, 0),   # Reculer X
-            (0, 15, 0, 0),    # Avancer Y
-            (0, -15, 0, 0),   # Reculer Y
-            (0, 0, 0, 30),    # Tourner
-            (0, 0, 0, -30),   # Tourner inverse
-        ]
-        
-        for dx, dy, dz, dr in sequences:
-            if self.micro_move(dx, dy, dz, dr):
-                # Vérifier si on est sorti de la zone rouge
-                is_red, msg = self.is_in_red_zone()
-                if not is_red:
-                    print("🎉 Robot sorti de la zone rouge!")
-                    return True
-            time.sleep(0.2)
-        
-        # Si toujours bloqué, tentative plus agressive
-        print("🔄 Tentative de mouvement forcé vers home...")
-        try:
-            self.dobot.move_to(200, 0, 180, 0, wait=True)
-            time.sleep(0.5)
-            self.dobot.move_to(200, 0, 150, 0, wait=True)
-            self.current_pos = self.dobot.pose()
-            is_red, msg = self.is_in_red_zone()
-            if not is_red:
-                print("✅ Retour home réussi!")
-                return True
-        except:
-            pass
-        
-        return False
-    
-    def move_to_safe_position(self, x, y, z, r):
-        """Déplacement intelligent vers une position sûre"""
-        try:
-            print(f"📍 Déplacement vers ({x}, {y}, {z})")
-            
-            # Lire position actuelle
-            pose = self.dobot.pose()
-            curr_x, curr_y, curr_z = pose[0], pose[1], pose[2]
-            
-            # Monter en hauteur d'abord
-            if abs(curr_z - z) > 30:
-                print("   → Montée en hauteur sécurisée")
-                self.dobot.move_to(curr_x, curr_y, 180, r, wait=True)
-                time.sleep(0.3)
-            
-            # Mouvement final
-            self.dobot.move_to(x, y, z, r, wait=True)
-            time.sleep(0.5)
-            
-            self.current_pos = self.dobot.pose()
-            print(f"   ✅ Position atteinte: X={self.current_pos[0]:.1f}, Y={self.current_pos[1]:.1f}")
-            return True
-            
-        except Exception as e:
-            print(f"   ❌ Échec: {e}")
-            return False
-    
-    def full_auto_recovery(self):
-        """Récupération complète 100% automatique"""
-        print("\n" + "="*50)
-        print("🤖 DOBOT AUTO-RECOVERY SYSTEM")
-        print("="*50)
-        
-        # Connexion
-        if not self.connect():
-            print("❌ Impossible de se connecter au Dobot")
-            return False
-        
-        # Vérifier zone
-        is_red, msg = self.is_in_red_zone()
-        if is_red:
-            print(f"🔴 Robot en ZONE ROUGE: {msg}")
-            print("🚀 Lancement séquence d'auto-déblocage...")
-            
-            if self.emergency_unlock_sequence():
-                print("✅ Auto-déblocage réussi!")
-            else:
-                print("⚠️ Auto-déblocage partiel")
-        else:
-            print("🟢 Robot en zone normale")
-        
-        # Retour à home sécurisé
-        print("\n📍 Retour à la position home...")
-        if self.move_to_safe_position(200, 0, 150, 0):
-            final_pos = self.current_pos
-            print(f"\n🎉 RÉCUPÉRATION COMPLÈTE RÉUSSIE!")
-            print(f"📍 Position finale: X={final_pos[0]:.1f}, Y={final_pos[1]:.1f}, Z={final_pos[2]:.1f}")
-            
-            # Vérification finale
-            if abs(final_pos[0] - 200) < 20 and abs(final_pos[1]) < 20:
-                print("✅ Robot en position correcte (zone verte)")
-            return True
-        else:
-            print("\n❌ Récupération échouée")
-            return False
 
-def main():
-    """Fonction principale"""
-    robot = DobotAutoRecovery()
+def force_unlock_with_hard_reset():
+    """Tentative de déblocage avec reset matériel"""
     
-    # Exécuter la récupération automatique
-    if robot.full_auto_recovery():
-        print("\n✅ Robot prêt à être utilisé")
-        sys.exit(0)
-    else:
-        print("\n❌ Impossible de récupérer le robot automatiquement")
-        sys.exit(1)
+    print("\n" + "="*50)
+    print("🔧 DOBOT HARD RESET RECOVERY")
+    print("="*50)
+    
+    # 1. Tenter de lire la position
+    try:
+        dobot = Dobot(port=PORT, verbose=False)
+        pose = dobot.pose()
+        print(f"📍 Position avant reset: X={pose[0]:.1f}, Y={pose[1]:.1f}, Z={pose[2]:.1f}")
+        dobot.close()
+    except:
+        print("⚠️ Impossible de lire la position")
+    
+    # 2. Reset USB matériel
+    if usb_power_cycle():
+        time.sleep(2)
+    
+    # 3. Reconnexion
+    try:
+        dobot = Dobot(port=PORT, verbose=False)
+        print("✅ Reconnexion réussie")
+        
+        # 4. Envoyer un mouvement forcé vers home
+        print("📍 Tentative de retour au home...")
+        dobot.move_to(200, 0, 150, 0, wait=True)
+        time.sleep(1)
+        
+        # 5. Vérifier la nouvelle position
+        pose = dobot.pose()
+        print(f"📍 Position après reset: X={pose[0]:.1f}, Y={pose[1]:.1f}, Z={pose[2]:.1f}")
+        
+        if abs(pose[0] - 200) < 50 and abs(pose[1]) < 50:
+            print("🎉 Robot débloqué avec succès!")
+            return True
+        else:
+            print("⚠️ Robot toujours bloqué")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Erreur: {e}")
+        return False
 
 if __name__ == "__main__":
-    main()
+    if force_unlock_with_hard_reset():
+        sys.exit(0)
+    else:
+        print("\n❌ Le robot est physiquement coincé en butée")
+        print("Solution: Déplacer manuellement le bras (UNE SEULE FOIS)")
+        sys.exit(1)
