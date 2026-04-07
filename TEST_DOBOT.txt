@@ -1,248 +1,224 @@
 #!/usr/bin/env python3
 """
-Dobot Control Server - Version Simple et Stable
+DOBOT AUTO-RECOVERY - 100% AUTOMATIQUE
+Sortie automatique de la zone rouge SANS intervention humaine
 """
 
-from flask import Flask, request, jsonify
 from pydobot import Dobot
 import time
-import threading
-import math
-import socket
+import serial
+import subprocess
+import sys
 
-app = Flask(__name__)
-
-# Variables globales
-dobot = None
-is_executing = False
-stop_flag = False
-
-# Configuration
 PORT = '/dev/ttyUSB0'
-SERVER_PORT = 5000
-SERVER_HOST = '0.0.0.0'
+AUTO_RECOVERY_ATTEMPTS = 5
 
-# Vitesses sécurisées
-DEFAULT_VELOCITY = 80
-DEFAULT_ACCELERATION = 60
-
-# Zones de sécurité (pour éviter les blocages)
-SAFE_ZONES = {
-    'x_min': 80, 'x_max': 300,
-    'y_min': -150, 'y_max': 150,
-    'z_min': 100, 'z_max': 200,
-}
-
-def get_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        return '127.0.0.1'
-
-def enforce_limits(x, y, z, r):
-    """Force les coordonnées dans les zones sûres"""
-    x = max(SAFE_ZONES['x_min'], min(SAFE_ZONES['x_max'], x))
-    y = max(SAFE_ZONES['y_min'], min(SAFE_ZONES['y_max'], y))
-    z = max(SAFE_ZONES['z_min'], min(SAFE_ZONES['z_max'], z))
-    return x, y, z, r
-
-def safe_move(x, y, z, r):
-    """Déplacement sécurisé"""
-    global dobot
-    
-    # Appliquer les limites
-    x, y, z, r = enforce_limits(x, y, z, r)
-    
-    try:
-        print(f"📍 Move to: ({x:.1f}, {y:.1f}, {z:.1f})")
-        dobot.move_to(x, y, z, r, wait=True)
-        time.sleep(0.3)
+class DobotAutoRecovery:
+    def __init__(self):
+        self.dobot = None
+        self.current_pos = (0, 0, 0, 0)
         
-        # Vérifier
-        pose = dobot.pose()
-        if abs(pose[0] - x) < 10 and abs(pose[1] - y) < 10:
-            print("✅ Move OK")
-            return True, None
-        else:
-            return False, "Position not reached"
-    except Exception as e:
-        print(f"❌ Move failed: {e}")
-        return False, str(e)
-
-def auto_recover():
-    """Auto-récupération"""
-    global dobot
-    print("🔄 Auto-recovery...")
-    
-    try:
-        # Fermer et rouvrir la connexion
-        dobot.close()
-        time.sleep(1)
-        dobot = Dobot(port=PORT, verbose=False)
-        time.sleep(1)
-        
-        # Aller à home
-        dobot.move_to(200, 0, 150, 0, wait=True)
-        print("✅ Recovery OK")
-        return True
-    except:
-        print("❌ Recovery failed")
-        return False
-
-def init_dobot():
-    global dobot
-    try:
-        dobot = Dobot(port=PORT, verbose=False)
-        dobot.speed(DEFAULT_VELOCITY, DEFAULT_ACCELERATION)
-        pose = dobot.pose()
-        print(f"✅ Dobot connecté: ({pose[0]:.1f}, {pose[1]:.1f}, {pose[2]:.1f})")
-        return True
-    except Exception as e:
-        print(f"❌ Connexion échouée: {e}")
-        return False
-
-# ==================== ENDPOINTS ====================
-
-@app.route('/')
-def index():
-    return jsonify({
-        'server': 'Dobot Controller',
-        'ip': get_ip(),
-        'port': SERVER_PORT
-    })
-
-@app.route('/status')
-def status():
-    pos = None
-    if dobot:
+    def connect(self):
+        """Connexion au Dobot"""
         try:
-            p = dobot.pose()
-            pos = {'x': p[0], 'y': p[1], 'z': p[2], 'r': p[3]}
-        except:
-            pos = {'error': 'Robot not responding'}
+            self.dobot = Dobot(port=PORT, verbose=False)
+            self.current_pos = self.dobot.pose()
+            print(f"✅ Connecté: ({self.current_pos[0]:.1f}, {self.current_pos[1]:.1f}, {self.current_pos[2]:.1f})")
+            return True
+        except Exception as e:
+            print(f"❌ Connexion échouée: {e}")
+            return False
     
-    return jsonify({
-        'connected': dobot is not None,
-        'position': pos,
-        'executing': is_executing
-    })
-
-@app.route('/manual', methods=['POST'])
-def manual():
-    global is_executing
-    
-    if not dobot:
-        return jsonify({'error': 'Dobot not connected'}), 503
-    
-    data = request.json
-    if not data:
-        return jsonify({'error': 'No data'}), 400
-    
-    command = data.get('command')
-    
-    # Home
-    if command == 'home':
-        success, err = safe_move(200, 0, 150, 0)
-        if success:
-            return jsonify({'success': True, 'message': 'Home OK'})
-        return jsonify({'error': err}), 500
-    
-    # Move absolute
-    elif command == 'move':
-        x = float(data.get('x', 200))
-        y = float(data.get('y', 0))
-        z = float(data.get('z', 150))
-        r = float(data.get('r', 0))
+    def is_in_red_zone(self):
+        """Détecte si le robot est en zone rouge (bloqué)"""
+        x, y, z, r = self.current_pos
         
-        success, err = safe_move(x, y, z, r)
-        if success:
-            return jsonify({'success': True, 'message': f'Moved to ({x},{y},{z})'})
-        return jsonify({'error': err}), 500
+        # Zones rouges = positions extrêmes qui bloquent le robot
+        if y < -180 or y > 180:  # Trop loin en Y
+            return True, f"Y={y:.1f} hors limite"
+        if x < 90 or x > 310:     # Trop loin en X
+            return True, f"X={x:.1f} hors limite"
+        if z < 80 or z > 220:     # Trop bas ou trop haut
+            return True, f"Z={z:.1f} hors limite"
+        return False, "OK"
     
-    # Move relative
-    elif command == 'move_relative':
-        dx = float(data.get('params', {}).get('dx', 0))
-        dy = float(data.get('params', {}).get('dy', 0))
-        dz = float(data.get('params', {}).get('dz', 0))
-        dr = float(data.get('params', {}).get('dr', 0))
+    def micro_move(self, dx, dy, dz, dr, max_retries=3):
+        """Micro-mouvement avec tentatives multiples"""
+        for attempt in range(max_retries):
+            try:
+                x, y, z, r = self.current_pos
+                new_x = x + dx
+                new_y = y + dy
+                new_z = z + dz
+                new_r = r + dr
+                
+                print(f"   → Micro-mouvement: ({dx:.0f},{dy:.0f},{dz:.0f})")
+                self.dobot.move_to(new_x, new_y, new_z, new_r, wait=True)
+                time.sleep(0.3)
+                
+                # Mettre à jour position
+                self.current_pos = self.dobot.pose()
+                return True
+            except Exception as e:
+                print(f"   ⚠️ Tentative {attempt+1} échouée: {e}")
+                time.sleep(0.5)
+        return False
+    
+    def emergency_unlock_sequence(self):
+        """Séquence de déblocage d'urgence (100% automatique)"""
+        print("🔄 DÉBLOCAGE AUTOMATIQUE...")
         
+        # Étape 1: Tentative de micro-mouvements pour sortir de la butée
+        sequences = [
+            (0, 0, 10, 0),   # Monter un peu
+            (0, 0, -5, 0),   # Redescendre (débloque parfois)
+            (10, 0, 0, 0),   # Avancer X
+            (-10, 0, 0, 0),  # Reculer X
+            (0, 10, 0, 0),   # Avancer Y
+            (0, -10, 0, 0),  # Reculer Y
+            (0, 0, 0, 30),   # Tourner
+            (0, 0, 0, -30),  # Tourner inverse
+        ]
+        
+        for dx, dy, dz, dr in sequences:
+            if self.micro_move(dx, dy, dz, dr):
+                print(f"   ✅ Micro-mouvement réussi")
+                # Vérifier si on est sorti de la zone rouge
+                is_red, msg = self.is_in_red_zone()
+                if not is_red:
+                    print("🎉 Robot sorti de la zone rouge!")
+                    return True
+        
+        # Étape 2: Réinitialisation série (reset USB)
+        print("🔄 Tentative de reset série...")
         try:
-            pose = dobot.pose()
-            new_x = pose[0] + dx
-            new_y = pose[1] + dy
-            new_z = pose[2] + dz
-            new_r = pose[3] + dr
+            # Fermer la connexion série
+            self.dobot.close()
+            time.sleep(1)
             
-            success, err = safe_move(new_x, new_y, new_z, new_r)
-            if success:
-                return jsonify({'success': True, 'message': f'Relative move OK'})
-            return jsonify({'error': err}), 500
+            # Forcer la réinitialisation du port série
+            ser = serial.Serial(PORT)
+            ser.setDTR(False)
+            time.sleep(0.5)
+            ser.setDTR(True)
+            ser.close()
+            time.sleep(1)
+            
+            # Reconnexion
+            self.dobot = Dobot(port=PORT, verbose=False)
+            self.current_pos = self.dobot.pose()
+            print("✅ Reset série réussi")
+            
+            # Vérifier position
+            is_red, msg = self.is_in_red_zone()
+            if not is_red:
+                return True
+                
         except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    # Get position
-    elif command == 'get_position':
+            print(f"❌ Reset série échoué: {e}")
+        
+        # Étape 3: Tentative de mouvement forcé vers home
+        print("🔄 Tentative de retour forcé au home...")
         try:
-            pose = dobot.pose()
-            return jsonify({
-                'success': True,
-                'position': {
-                    'x': round(pose[0], 2),
-                    'y': round(pose[1], 2),
-                    'z': round(pose[2], 2),
-                    'r': round(pose[3], 2)
-                }
-            })
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    # Recovery
-    elif command == 'recover':
-        if auto_recover():
-            return jsonify({'success': True, 'message': 'Recovery OK'})
-        return jsonify({'error': 'Recovery failed'}), 500
-    
-    # Gripper
-    elif command == 'gripper':
-        state = data.get('state', 'open')
-        try:
-            dobot.grip(state.lower() == 'close')
-            return jsonify({'success': True, 'message': f'Gripper {state}'})
+            self.dobot.move_to(200, 0, 150, 0, wait=True)
+            self.current_pos = self.dobot.pose()
+            is_red, msg = self.is_in_red_zone()
+            if not is_red:
+                print("✅ Retour au home réussi!")
+                return True
         except:
-            return jsonify({'error': 'Gripper failed'}), 500
+            pass
+        
+        return False
     
-    return jsonify({'error': f'Unknown command: {command}'}), 400
-
-@app.route('/stop', methods=['POST'])
-def stop():
-    global stop_flag
-    stop_flag = True
-    return jsonify({'success': True, 'message': 'Stop sent'})
-
-# ==================== MAIN ====================
-
-if __name__ == '__main__':
-    print("\n" + "="*50)
-    print("🤖 DOBOT CONTROL SERVER")
-    print("="*50)
+    def move_to_safe_position(self, x, y, z, r, max_attempts=3):
+        """Déplacement intelligent vers une position sûre"""
+        
+        for attempt in range(max_attempts):
+            try:
+                print(f"📍 Déplacement vers ({x}, {y}, {z}) - Tentative {attempt+1}")
+                
+                # Vérifier si en zone rouge avant mouvement
+                is_red, msg = self.is_in_red_zone()
+                if is_red:
+                    print(f"🔴 Robot en zone rouge: {msg}")
+                    if not self.emergency_unlock_sequence():
+                        print("❌ Impossible de débloquer")
+                        return False
+                
+                # Appliquer les limites de sécurité
+                safe_x = max(100, min(300, x))
+                safe_y = max(-150, min(150, y))
+                safe_z = max(100, min(200, z))
+                
+                # Mouvement en hauteur d'abord pour éviter collisions
+                curr = self.current_pos
+                if abs(curr[2] - safe_z) > 30:
+                    print("   → Montée en hauteur sécurisée")
+                    self.dobot.move_to(curr[0], curr[1], 180, curr[3], wait=True)
+                    time.sleep(0.3)
+                
+                # Mouvement final
+                self.dobot.move_to(safe_x, safe_y, safe_z, r, wait=True)
+                time.sleep(0.5)
+                
+                self.current_pos = self.dobot.pose()
+                print(f"   ✅ Position atteinte: ({self.current_pos[0]:.1f}, {self.current_pos[1]:.1f})")
+                return True
+                
+            except Exception as e:
+                print(f"   ❌ Échec: {e}")
+                time.sleep(1)
+                continue
+        
+        return False
     
-    # Connexion au Dobot
-    if init_dobot():
-        print(f"✅ Dobot prêt")
+    def full_auto_recovery(self):
+        """Récupération complète 100% automatique"""
+        print("\n" + "="*50)
+        print("🤖 DOBOT AUTO-RECOVERY SYSTEM")
+        print("="*50)
+        
+        # Connexion
+        if not self.connect():
+            print("❌ Impossible de se connecter au Dobot")
+            return False
+        
+        # Vérifier zone
+        is_red, msg = self.is_in_red_zone()
+        if is_red:
+            print(f"🔴 Robot en ZONE ROUGE: {msg}")
+            print("🚀 Lancement séquence d'auto-déblocage...")
+            
+            if self.emergency_unlock_sequence():
+                print("✅ Auto-déblocage réussi!")
+            else:
+                print("⚠️ Auto-déblocage partiel, tentative de repositionnement...")
+        else:
+            print("🟢 Robot en zone normale")
+        
+        # Retour à home sécurisé
+        print("\n📍 Retour à la position home...")
+        if self.move_to_safe_position(200, 0, 150, 0):
+            print("\n🎉 RÉCUPÉRATION COMPLÈTE RÉUSSIE!")
+            print(f"📍 Position finale: ({self.current_pos[0]:.1f}, {self.current_pos[1]:.1f}, {self.current_pos[2]:.1f})")
+            return True
+        else:
+            print("\n❌ Récupération échouée")
+            return False
+
+def main():
+    """Fonction principale"""
+    robot = DobotAutoRecovery()
+    
+    # Exécuter la récupération automatique
+    if robot.full_auto_recovery():
+        print("\n✅ Robot prêt à être utilisé")
+        sys.exit(0)
     else:
-        print("⚠️ Dobot non connecté - vérifie le câble USB")
-    
-    # Info réseau
-    ip = get_ip()
-    print(f"🌐 Serveur: http://{ip}:{SERVER_PORT}")
-    print("="*50)
-    print("🚀 Démarrage...\n")
-    
-    try:
-        app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
-    except KeyboardInterrupt:
-        print("\n👋 Arrêt du serveur")
+        print("\n❌ Impossible de récupérer le robot automatiquement")
+        print("⚠️ Dernier recours: vérifier le câble USB et l'alimentation")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
