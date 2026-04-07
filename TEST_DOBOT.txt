@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""
+Dobot Control Server - Version Simple et Stable
+"""
+
+from flask import Flask, request, jsonify
+from pydobot import Dobot
+import time
+import threading
+import math
+import socket
+
+app = Flask(__name__)
+
+# Variables globales
+dobot = None
+is_executing = False
+stop_flag = False
+
+# Configuration
+PORT = '/dev/ttyUSB0'
+SERVER_PORT = 5000
+SERVER_HOST = '0.0.0.0'
+
+# Vitesses sécurisées
+DEFAULT_VELOCITY = 80
+DEFAULT_ACCELERATION = 60
+
+# Zones de sécurité (pour éviter les blocages)
+SAFE_ZONES = {
+    'x_min': 80, 'x_max': 300,
+    'y_min': -150, 'y_max': 150,
+    'z_min': 100, 'z_max': 200,
+}
+
+def get_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return '127.0.0.1'
+
+def enforce_limits(x, y, z, r):
+    """Force les coordonnées dans les zones sûres"""
+    x = max(SAFE_ZONES['x_min'], min(SAFE_ZONES['x_max'], x))
+    y = max(SAFE_ZONES['y_min'], min(SAFE_ZONES['y_max'], y))
+    z = max(SAFE_ZONES['z_min'], min(SAFE_ZONES['z_max'], z))
+    return x, y, z, r
+
+def safe_move(x, y, z, r):
+    """Déplacement sécurisé"""
+    global dobot
+    
+    # Appliquer les limites
+    x, y, z, r = enforce_limits(x, y, z, r)
+    
+    try:
+        print(f"📍 Move to: ({x:.1f}, {y:.1f}, {z:.1f})")
+        dobot.move_to(x, y, z, r, wait=True)
+        time.sleep(0.3)
+        
+        # Vérifier
+        pose = dobot.pose()
+        if abs(pose[0] - x) < 10 and abs(pose[1] - y) < 10:
+            print("✅ Move OK")
+            return True, None
+        else:
+            return False, "Position not reached"
+    except Exception as e:
+        print(f"❌ Move failed: {e}")
+        return False, str(e)
+
+def auto_recover():
+    """Auto-récupération"""
+    global dobot
+    print("🔄 Auto-recovery...")
+    
+    try:
+        # Fermer et rouvrir la connexion
+        dobot.close()
+        time.sleep(1)
+        dobot = Dobot(port=PORT, verbose=False)
+        time.sleep(1)
+        
+        # Aller à home
+        dobot.move_to(200, 0, 150, 0, wait=True)
+        print("✅ Recovery OK")
+        return True
+    except:
+        print("❌ Recovery failed")
+        return False
+
+def init_dobot():
+    global dobot
+    try:
+        dobot = Dobot(port=PORT, verbose=False)
+        dobot.speed(DEFAULT_VELOCITY, DEFAULT_ACCELERATION)
+        pose = dobot.pose()
+        print(f"✅ Dobot connecté: ({pose[0]:.1f}, {pose[1]:.1f}, {pose[2]:.1f})")
+        return True
+    except Exception as e:
+        print(f"❌ Connexion échouée: {e}")
+        return False
+
+# ==================== ENDPOINTS ====================
+
+@app.route('/')
+def index():
+    return jsonify({
+        'server': 'Dobot Controller',
+        'ip': get_ip(),
+        'port': SERVER_PORT
+    })
+
+@app.route('/status')
+def status():
+    pos = None
+    if dobot:
+        try:
+            p = dobot.pose()
+            pos = {'x': p[0], 'y': p[1], 'z': p[2], 'r': p[3]}
+        except:
+            pos = {'error': 'Robot not responding'}
+    
+    return jsonify({
+        'connected': dobot is not None,
+        'position': pos,
+        'executing': is_executing
+    })
+
+@app.route('/manual', methods=['POST'])
+def manual():
+    global is_executing
+    
+    if not dobot:
+        return jsonify({'error': 'Dobot not connected'}), 503
+    
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No data'}), 400
+    
+    command = data.get('command')
+    
+    # Home
+    if command == 'home':
+        success, err = safe_move(200, 0, 150, 0)
+        if success:
+            return jsonify({'success': True, 'message': 'Home OK'})
+        return jsonify({'error': err}), 500
+    
+    # Move absolute
+    elif command == 'move':
+        x = float(data.get('x', 200))
+        y = float(data.get('y', 0))
+        z = float(data.get('z', 150))
+        r = float(data.get('r', 0))
+        
+        success, err = safe_move(x, y, z, r)
+        if success:
+            return jsonify({'success': True, 'message': f'Moved to ({x},{y},{z})'})
+        return jsonify({'error': err}), 500
+    
+    # Move relative
+    elif command == 'move_relative':
+        dx = float(data.get('params', {}).get('dx', 0))
+        dy = float(data.get('params', {}).get('dy', 0))
+        dz = float(data.get('params', {}).get('dz', 0))
+        dr = float(data.get('params', {}).get('dr', 0))
+        
+        try:
+            pose = dobot.pose()
+            new_x = pose[0] + dx
+            new_y = pose[1] + dy
+            new_z = pose[2] + dz
+            new_r = pose[3] + dr
+            
+            success, err = safe_move(new_x, new_y, new_z, new_r)
+            if success:
+                return jsonify({'success': True, 'message': f'Relative move OK'})
+            return jsonify({'error': err}), 500
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    # Get position
+    elif command == 'get_position':
+        try:
+            pose = dobot.pose()
+            return jsonify({
+                'success': True,
+                'position': {
+                    'x': round(pose[0], 2),
+                    'y': round(pose[1], 2),
+                    'z': round(pose[2], 2),
+                    'r': round(pose[3], 2)
+                }
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    # Recovery
+    elif command == 'recover':
+        if auto_recover():
+            return jsonify({'success': True, 'message': 'Recovery OK'})
+        return jsonify({'error': 'Recovery failed'}), 500
+    
+    # Gripper
+    elif command == 'gripper':
+        state = data.get('state', 'open')
+        try:
+            dobot.grip(state.lower() == 'close')
+            return jsonify({'success': True, 'message': f'Gripper {state}'})
+        except:
+            return jsonify({'error': 'Gripper failed'}), 500
+    
+    return jsonify({'error': f'Unknown command: {command}'}), 400
+
+@app.route('/stop', methods=['POST'])
+def stop():
+    global stop_flag
+    stop_flag = True
+    return jsonify({'success': True, 'message': 'Stop sent'})
+
+# ==================== MAIN ====================
+
+if __name__ == '__main__':
+    print("\n" + "="*50)
+    print("🤖 DOBOT CONTROL SERVER")
+    print("="*50)
+    
+    # Connexion au Dobot
+    if init_dobot():
+        print(f"✅ Dobot prêt")
+    else:
+        print("⚠️ Dobot non connecté - vérifie le câble USB")
+    
+    # Info réseau
+    ip = get_ip()
+    print(f"🌐 Serveur: http://{ip}:{SERVER_PORT}")
+    print("="*50)
+    print("🚀 Démarrage...\n")
+    
+    try:
+        app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
+    except KeyboardInterrupt:
+        print("\n👋 Arrêt du serveur")
