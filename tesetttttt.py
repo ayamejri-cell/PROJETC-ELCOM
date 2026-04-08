@@ -1,8 +1,10 @@
 """
 
-Dobot Magician Control Server - CORRECTED VERSION
-Corrections basées sur le manuel Dobot (pages 14, 67, 82)
-Objectif: Éliminer l'entrée dans les zones rouges (limited position)
+Dobot Magician Control Server - PREVENTION TOTALE DES ZONES ROUGES
+Avec correction automatique des positions avant mouvement
+
+Philosophie: Ne JAMAIS entrer en zone rouge (correction à la base)
+Le robot exécute TOUS les mouvements (corrigés automatiquement)
 
 Author: Your Name
 Date: 2024
@@ -12,12 +14,9 @@ from flask import Flask, request, jsonify
 from pydobot import Dobot
 import time
 import threading
-import platform
-from queue import Queue, Empty
 import math
 import socket
 import os
-import sys
 import json
 from datetime import datetime
 
@@ -41,7 +40,7 @@ PORT = '/dev/ttyUSB0'
 SERVER_PORT = 5000
 SERVER_HOST = '0.0.0.0'
 
-# Movement parameters - BALANCED FOR RELIABILITY
+# Movement parameters
 MOVEMENT_TIMEOUT = 30
 MAX_RETRIES = 3
 DEFAULT_VELOCITY = 150
@@ -50,30 +49,119 @@ FAST_TRAJECTORY_VELOCITY = 200
 FAST_TRAJECTORY_ACCELERATION = 200
 MINIMUM_PAUSE_TIME = 0.1
 GRIPPER_OPERATION_DELAY = 0.2
-WAYPOINT_TRANSITION_DELAY = 0.1
 
 # ============================================================================
-# WORKSPACE LIMITS - CORRIGÉ SELON MANUEL DOBOT (Pages 14, 67, 82)
+# WORKSPACE LIMITS - BASÉ SUR MANUEL DOBOT (Pages 14, 67, 82)
 # ============================================================================
-# Les valeurs originales causaient des zones rouges car trop larges
-# Les nouvelles valeurs sont basées UNIQUEMENT sur le manuel
 
 WORKSPACE_LIMITS = {
-    'x': [-80, 80],      # CORRIGÉ: basé sur rayon max 80mm (manuel p.67, p.82)
-    'y': [-80, 80],      # CORRIGÉ: basé sur rayon max 80mm (manuel p.67, p.82)
-    'z': [0, 150],       # CORRIGÉ: Z min = surface (manuel p.67, p.82)
-    'r': [-150, 150],    # CORRIGÉ: rotation outil ±150° (manuel p.14)
-    'min_radius': 0,     # CORRIGÉ: pas de minimum spécifié dans manuel
-    'max_radius': 80     # CORRIGÉ: 80mm max (manuel p.67, p.82)
+    'x': [-80, 80],
+    'y': [-80, 80],
+    'z': [0, 150],
+    'r': [-150, 150],
+    'max_radius': 80
 }
+
+# Position HOME sécurisée (rayon = 50mm < 80mm)
+HOME_POSITION = {'x': 50, 'y': 0, 'z': 100, 'r': 0}
 
 
 # ============================================================================
-# SIMPLE NETWORK FUNCTIONS (inchangé)
+# FONCTION CRITIQUE : CORRECTION AUTOMATIQUE DES POSITIONS
+# ============================================================================
+
+def validate_and_correct_position(x, y, z, r):
+    """
+    Valide ET CORRIGE automatiquement les positions dangereuses.
+    Le robot n'entre JAMAIS en zone rouge car on corrige avant.
+    
+    Retourne: (x_corrige, y_corrige, z_corrige, r_corrige, a_ete_corrige)
+    """
+    
+    x_c, y_c, z_c, r_c = x, y, z, r
+    a_ete_corrige = False
+    corrections = []
+    
+    # 1. CORRECTION DU RAYON (trop loin = ramené à la limite)
+    radius = math.sqrt(x_c**2 + y_c**2)
+    if radius > WORKSPACE_LIMITS['max_radius']:
+        ratio = WORKSPACE_LIMITS['max_radius'] / radius
+        x_c = x_c * ratio
+        y_c = y_c * ratio
+        corrections.append(f"Rayon {radius:.1f}mm → {WORKSPACE_LIMITS['max_radius']}mm")
+        a_ete_corrige = True
+    
+    # 2. CORRECTION Z (trop bas = remonté à 0)
+    if z_c < WORKSPACE_LIMITS['z'][0]:
+        corrections.append(f"Z {z_c:.1f}mm → {WORKSPACE_LIMITS['z'][0]}mm")
+        z_c = WORKSPACE_LIMITS['z'][0]
+        a_ete_corrige = True
+    
+    # 3. CORRECTION Z (trop haut = descendu à max)
+    if z_c > WORKSPACE_LIMITS['z'][1]:
+        corrections.append(f"Z {z_c:.1f}mm → {WORKSPACE_LIMITS['z'][1]}mm")
+        z_c = WORKSPACE_LIMITS['z'][1]
+        a_ete_corrige = True
+    
+    # 4. CORRECTION R (rotation outil - manuel p.14)
+    if r_c < WORKSPACE_LIMITS['r'][0]:
+        corrections.append(f"R {r_c:.1f}° → {WORKSPACE_LIMITS['r'][0]}°")
+        r_c = WORKSPACE_LIMITS['r'][0]
+        a_ete_corrige = True
+    if r_c > WORKSPACE_LIMITS['r'][1]:
+        corrections.append(f"R {r_c:.1f}° → {WORKSPACE_LIMITS['r'][1]}°")
+        r_c = WORKSPACE_LIMITS['r'][1]
+        a_ete_corrige = True
+    
+    # 5. CORRECTION X/Y individuelles (sécurité supplémentaire)
+    if x_c < WORKSPACE_LIMITS['x'][0]:
+        corrections.append(f"X {x_c:.1f}mm → {WORKSPACE_LIMITS['x'][0]}mm")
+        x_c = WORKSPACE_LIMITS['x'][0]
+        a_ete_corrige = True
+    if x_c > WORKSPACE_LIMITS['x'][1]:
+        corrections.append(f"X {x_c:.1f}mm → {WORKSPACE_LIMITS['x'][1]}mm")
+        x_c = WORKSPACE_LIMITS['x'][1]
+        a_ete_corrige = True
+    if y_c < WORKSPACE_LIMITS['y'][0]:
+        corrections.append(f"Y {y_c:.1f}mm → {WORKSPACE_LIMITS['y'][0]}mm")
+        y_c = WORKSPACE_LIMITS['y'][0]
+        a_ete_corrige = True
+    if y_c > WORKSPACE_LIMITS['y'][1]:
+        corrections.append(f"Y {y_c:.1f}mm → {WORKSPACE_LIMITS['y'][1]}mm")
+        y_c = WORKSPACE_LIMITS['y'][1]
+        a_ete_corrige = True
+    
+    if a_ete_corrige:
+        print(f"⚠️ CORRECTION AUTO: {', '.join(corrections)}")
+    
+    return x_c, y_c, z_c, r_c, a_ete_corrige
+
+
+def check_if_position_safe(x, y, z, r):
+    """
+    Vérifie si une position est dans la zone sûre (sans correction)
+    Retourne: (est_safe, message, rayon)
+    """
+    radius = math.sqrt(x**2 + y**2)
+    
+    if radius > WORKSPACE_LIMITS['max_radius']:
+        return False, f"Rayon {radius:.1f}mm > {WORKSPACE_LIMITS['max_radius']}mm", radius
+    if z < WORKSPACE_LIMITS['z'][0]:
+        return False, f"Z {z:.1f}mm < {WORKSPACE_LIMITS['z'][0]}mm", radius
+    if z > WORKSPACE_LIMITS['z'][1]:
+        return False, f"Z {z:.1f}mm > {WORKSPACE_LIMITS['z'][1]}mm", radius
+    if abs(r) > WORKSPACE_LIMITS['r'][1]:
+        return False, f"R {r:.1f}° > ±{WORKSPACE_LIMITS['r'][1]}°", radius
+    
+    return True, "OK", radius
+
+
+# ============================================================================
+# NETWORK FUNCTIONS
 # ============================================================================
 
 def get_ip_address():
-    """Get the Raspberry Pi's IP address - SIMPLE VERSION"""
+    """Get the Raspberry Pi's IP address"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('8.8.8.8', 80))
@@ -87,147 +175,45 @@ def get_ip_address():
             return '127.0.0.1'
 
 
-def get_all_ips_simple():
-    """Get all IPs - simple version without netifaces"""
-    ips = {
-        'hostname': socket.gethostname(),
-        'primary': get_ip_address()
-    }
-    
-    try:
-        import subprocess
-        result = subprocess.run(['ip', 'addr', 'show'], 
-                              capture_output=True, text=True, timeout=2)
-        
-        current_iface = None
-        for line in result.stdout.split('\n'):
-            line = line.strip()
-            if ':' in line and line[0].isdigit():
-                parts = line.split(':')
-                if len(parts) > 1:
-                    current_iface = parts[1].strip()
-                    ips[current_iface] = []
-            elif 'inet ' in line and current_iface:
-                parts = line.split()
-                if len(parts) > 1:
-                    ip = parts[1].split('/')[0]
-                    if ip != '127.0.0.1':
-                        ips[current_iface].append(ip)
-    except:
-        pass
-    
-    return ips
-
-
-def print_simple_network_info():
-    """Print clean network information"""
+def print_network_info():
+    """Print network information"""
     print("\n" + "="*60)
     print("🌐 NETWORK INFORMATION")
     print("="*60)
     
-    all_ips = get_all_ips_simple()
-    primary_ip = all_ips.get('primary', '127.0.0.1')
-    
-    print(f"\n🏷️  Hostname: {all_ips.get('hostname', 'Unknown')}")
-    print(f"📍 Primary IP: {primary_ip}")
-    
-    print("\n🔌 Network Interfaces:")
-    for key, value in all_ips.items():
-        if key not in ['hostname', 'primary'] and isinstance(value, list):
-            interface_type = "🔌 Ethernet" if key.startswith('eth') else "📡 WiFi" if key.startswith('wlan') else "🖥️  Interface"
-            print(f"   {interface_type}: {key}")
-            for ip in value:
-                print(f"      IP: {ip}")
-    
-    print("\n" + "="*60)
-    print("🚀 ACCESS POINTS")
-    print("="*60)
-    
-    if 'eth0' in all_ips and all_ips['eth0']:
-        print(f"\n🔌 ETHERNET (RECOMMENDED):")
-        for ip in all_ips['eth0']:
-            print(f"   IP: {ip}")
-            print(f"   URL: http://{ip}:{SERVER_PORT}")
-            print(f"   Test: curl http://{ip}:{SERVER_PORT}/status")
-    
-    if 'wlan0' in all_ips and all_ips['wlan0']:
-        print(f"\n📡 WIFI:")
-        for ip in all_ips['wlan0']:
-            print(f"   IP: {ip}")
-            print(f"   URL: http://{ip}:{SERVER_PORT}")
-    
-    print(f"\n💻 LOCAL ACCESS:")
-    print(f"   URL: http://localhost:{SERVER_PORT}")
-    print(f"   URL: http://127.0.0.1:{SERVER_PORT}")
-    
+    ip = get_ip_address()
+    print(f"\n📍 IP Address: {ip}")
+    print(f"🌐 Server URL: http://{ip}:{SERVER_PORT}")
+    print(f"💻 Local URL: http://localhost:{SERVER_PORT}")
     print("\n" + "="*60)
 
 
 # ============================================================================
-# NOUVELLE FONCTION - Détection zone rouge (basée manuel p.5, p.12)
-# ============================================================================
-
-def check_limited_position(dobot_instance):
-    """
-    Détecte si le robot est en position limite (zone rouge)
-    Basé sur le manuel p.5 et p.12
-    RETOURNE: True si en zone rouge, False sinon
-    """
-    try:
-        pose = dobot_instance.pose()
-        x, y, z, r = pose[0], pose[1], pose[2], pose[3]
-        
-        radius = math.sqrt(x**2 + y**2)
-        
-        # Conditions de zone rouge selon le manuel
-        if radius > WORKSPACE_LIMITS['max_radius']:
-            print(f"⚠️ ZONE ROUGE DÉTECTÉE: Rayon {radius:.1f}mm > {WORKSPACE_LIMITS['max_radius']}mm (manuel p.67)")
-            return True
-        if z > WORKSPACE_LIMITS['z'][1]:
-            print(f"⚠️ ZONE ROUGE DÉTECTÉE: Z={z:.1f}mm > {WORKSPACE_LIMITS['z'][1]}mm (manuel p.67)")
-            return True
-        if z < WORKSPACE_LIMITS['z'][0]:
-            print(f"⚠️ ZONE ROUGE DÉTECTÉE: Z={z:.1f}mm < {WORKSPACE_LIMITS['z'][0]}mm (manuel p.67)")
-            return True
-        if abs(r) > WORKSPACE_LIMITS['r'][1]:
-            print(f"⚠️ ZONE ROUGE DÉTECTÉE: Rotation R={r:.1f}° > ±{WORKSPACE_LIMITS['r'][1]}° (manuel p.14)")
-            return True
-            
-        return False
-        
-    except Exception as e:
-        print(f"⚠️ Impossible de vérifier la position: {e}")
-        return True  # Par sécurité, on considère zone rouge
-
-
-# ============================================================================
-# DOBOT FUNCTIONS - FONCTIONS CORRIGÉES
+# DOBOT FUNCTIONS - AVEC CORRECTION AUTOMATIQUE
 # ============================================================================
 
 def init_dobot():
-    """Initialize Dobot connection - VERSION CORRIGÉE avec vérification zone rouge"""
+    """Initialize Dobot connection"""
     global dobot, connection_error
     
     print("🔌 INITIALIZING DOBOT...")
     
     try:
-        dobot = Dobot(port=PORT, verbose=True)
+        dobot = Dobot(port=PORT, verbose=False)
         pose = dobot.pose()
+        
         print(f"✅ DOBOT CONNECTED")
         print(f"   Port: {PORT}")
         print(f"   Position: X={pose[0]:.1f}, Y={pose[1]:.1f}, Z={pose[2]:.1f}, R={pose[3]:.1f}")
         
-        # NOUVEAU: Vérifier si la position actuelle est en zone rouge
-        if check_limited_position(dobot):
-            print("⚠️ Robot en zone rouge à l'initialisation!")
-            print("   → Déplacement vers HOME sécurisé (50, 0, 100)")
-            # Utiliser la position HOME sécurisée (rayon = 50mm < 80mm)
-            try:
-                dobot.move_to(50, 0, 100, 0, wait=True)
-                time.sleep(0.5)
-                print("   ✅ Déplacement sécurisé effectué")
-            except Exception as home_error:
-                print(f"   ⚠️ Impossible de déplacer le robot: {home_error}")
+        # Vérifier si la position actuelle est sûre
+        radius = math.sqrt(pose[0]**2 + pose[1]**2)
+        if radius > WORKSPACE_LIMITS['max_radius'] or pose[2] < 0:
+            print(f"⚠️ Robot en position dangereuse! Déplacement vers HOME...")
+            dobot.move_to(HOME_POSITION['x'], HOME_POSITION['y'], 
+                         HOME_POSITION['z'], HOME_POSITION['r'], wait=True)
+            time.sleep(0.5)
+            print(f"   ✅ Déplacement HOME effectué")
         
         try:
             dobot.speed(velocity=DEFAULT_VELOCITY, acceleration=DEFAULT_ACCELERATION)
@@ -235,11 +221,13 @@ def init_dobot():
         except:
             pass
         
-        # Afficher les nouvelles limites
-        print(f"   🔒 Limites de sécurité actives (manuel Dobot):")
-        print(f"      Rayon max: {WORKSPACE_LIMITS['max_radius']}mm")
-        print(f"      Z: {WORKSPACE_LIMITS['z'][0]}-{WORKSPACE_LIMITS['z'][1]}mm")
-        print(f"      Rotation outil: ±{WORKSPACE_LIMITS['r'][1]}°")
+        print(f"\n🔒 LIMITES DE SÉCURITÉ (manuel Dobot):")
+        print(f"   Rayon max: {WORKSPACE_LIMITS['max_radius']}mm")
+        print(f"   Z: {WORKSPACE_LIMITS['z'][0]}-{WORKSPACE_LIMITS['z'][1]}mm")
+        print(f"   Rotation outil: ±{WORKSPACE_LIMITS['r'][1]}°")
+        print(f"\n🔄 CORRECTION AUTOMATIQUE: ACTIVÉE")
+        print(f"   → Toutes les positions dangereuses sont corrigées automatiquement")
+        print(f"   → Le robot n'entre JAMAIS en zone rouge")
         
         connection_error = None
         return True
@@ -250,319 +238,141 @@ def init_dobot():
         return False
 
 
-def validate_position_advanced(x, y, z, r):
-    """
-    Validate position - VERSION CORRIGÉE basée sur manuel
-    NE PERMET PLUS LES POSITIONS HORS ZONE (élimine les zones rouges)
-    """
-    # Vérification X (basée sur rayon max)
-    if abs(x) > WORKSPACE_LIMITS['max_radius']:
-        return False, f"X={x:.1f} hors zone (max {WORKSPACE_LIMITS['max_radius']}mm - manuel p.67)"
-    if abs(y) > WORKSPACE_LIMITS['max_radius']:
-        return False, f"Y={y:.1f} hors zone (max {WORKSPACE_LIMITS['max_radius']}mm - manuel p.67)"
-    
-    # Vérification Z (manuel p.67)
-    if not (WORKSPACE_LIMITS['z'][0] <= z <= WORKSPACE_LIMITS['z'][1]):
-        return False, f"Z={z:.1f} hors zone (limite {WORKSPACE_LIMITS['z'][0]}-{WORKSPACE_LIMITS['z'][1]}mm - manuel p.67)"
-    
-    # Vérification R (manuel p.14)
-    if not (WORKSPACE_LIMITS['r'][0] <= r <= WORKSPACE_LIMITS['r'][1]):
-        return False, f"R={r:.1f}° hors zone (limite ±{WORKSPACE_LIMITS['r'][1]}° - manuel p.14)"
-    
-    # Vérification rayon (manuel p.67)
-    radial_distance = math.sqrt(x**2 + y**2)
-    if radial_distance > WORKSPACE_LIMITS['max_radius']:
-        return False, f"Rayon {radial_distance:.1f}mm > {WORKSPACE_LIMITS['max_radius']}mm (manuel p.67)"
-    
-    return True, None
-
-
-def move_with_timeout(dobot, x, y, z, r, timeout=15, retries=2):
-    """Ultra-fast movement with aggressive timeout - INCHANGÉ"""
-    for attempt in range(retries + 1):
-        result_queue = Queue()
-        
-        def move_thread():
-            try:
-                dobot.move_to(x, y, z, r, wait=True)
-                result_queue.put(('success', None))
-            except Exception as e:
-                result_queue.put(('error', str(e)))
-        
-        thread = threading.Thread(target=move_thread)
-        thread.daemon = True
-        thread.start()
-        
-        try:
-            result, error = result_queue.get(timeout=timeout)
-            if result == 'success':
-                return True, None
-            else:
-                if attempt < retries:
-                    time.sleep(0.1)
-                    continue
-                return False, error
-        except Empty:
-            if attempt < retries:
-                time.sleep(0.1)
-                continue
-            return False, f"Timeout after {timeout}s"
-    
-    return False, "Max retries exceeded"
-
-
 def safe_move_to(dobot, x, y, z, r, is_trajectory=False):
     """
-    PRECISE movement - VERSION CORRIGÉE
-    MAINETNANT BLOQUE LES MOUVEMENTS VERS ZONES ROUGES
+    Mouvement avec CORRECTION AUTOMATIQUE à la base.
+    Le robot n'entre JAMAIS en zone rouge car on corrige avant.
     """
     
-    print(f"📍 ATTEMPTING MOVE: ({x:.1f}, {y:.1f}, {z:.1f}, {r:.1f})")
+    # ÉTAPE 1: Corriger la position demandée (CRITIQUE)
+    x_corrige, y_corrige, z_corrige, r_corrige, a_ete_corrige = validate_and_correct_position(x, y, z, r)
     
-    # ============================================================
-    # ÉTAPE 1: VALIDATION OBLIGATOIRE (CORRIGÉ - NE PERMET PLUS LE PASSAGE)
-    # ============================================================
-    is_valid, error_msg = validate_position_advanced(x, y, z, r)
+    # Afficher la correction si nécessaire
+    if a_ete_corrige:
+        print(f"📍 Position originale: ({x:.1f}, {y:.1f}, {z:.1f}, {r:.1f})")
+        print(f"📍 Position corrigée: ({x_corrige:.1f}, {y_corrige:.1f}, {z_corrige:.1f}, {r_corrige:.1f})")
     
-    # CORRECTION CRITIQUE: On ne "proceed anyway" plus!
-    # Si la position est invalide, on bloque IMMÉDIATEMENT
-    if not is_valid:
-        print(f"❌ MOUVEMENT BLOQUÉ: {error_msg}")
-        print(f"   → Position refusée pour éviter zone rouge (manuel p.5, p.12)")
-        return False, error_msg
+    # ÉTAPE 2: Vérification de sécurité supplémentaire (juste pour log)
+    est_safe, message, radius = check_if_position_safe(x_corrige, y_corrige, z_corrige, r_corrige)
+    if not est_safe:
+        # Ce cas ne devrait jamais arriver car on a corrigé
+        print(f"⚠️ ATTENTION: Position encore dangereuse après correction: {message}")
+        return False, message
     
-    # ============================================================
-    # ÉTAPE 2: VÉRIFIER POSITION ACTUELLE (zone rouge)
-    # ============================================================
-    if check_limited_position(dobot):
-        return False, "Robot actuellement en zone rouge - mouvement interdit (manuel p.5)"
-    
+    # ÉTAPE 3: Vérifier que le robot n'est pas déjà dans une position dangereuse
     try:
-        # Get current position
         pose = dobot.pose()
-        curr_x, curr_y, curr_z, curr_r = pose[0], pose[1], pose[2], pose[3]
+        radius_actuel = math.sqrt(pose[0]**2 + pose[1]**2)
+        if radius_actuel > WORKSPACE_LIMITS['max_radius'] or pose[2] < 0:
+            print("🚨 Robot en position dangereuse! Récupération forcée vers HOME...")
+            dobot.move_to(HOME_POSITION['x'], HOME_POSITION['y'], 
+                         HOME_POSITION['z'], HOME_POSITION['r'], wait=True)
+            time.sleep(0.5)
+    except:
+        pass
+    
+    # ÉTAPE 4: Exécuter le mouvement corrigé
+    try:
+        print(f"🚀 Exécution mouvement: ({x_corrige:.1f}, {y_corrige:.1f}, {z_corrige:.1f}, {r_corrige:.1f})")
+        dobot.move_to(x_corrige, y_corrige, z_corrige, r_corrige, wait=True)
+        time.sleep(0.3)
         
-        print(f"📌 CURRENT POSITION: ({curr_x:.1f}, {curr_y:.1f}, {curr_z:.1f}, {curr_r:.1f})")
+        # Vérification post-mouvement (juste pour log)
+        new_pose = dobot.pose()
+        new_radius = math.sqrt(new_pose[0]**2 + new_pose[1]**2)
+        print(f"✅ Mouvement terminé - Position finale: rayon={new_radius:.1f}mm, Z={new_pose[2]:.1f}mm")
         
-        total_dist = math.sqrt((x - curr_x)**2 + (y - curr_y)**2 + (z - curr_z)**2)
-        print(f"📏 DISTANCE TO TARGET: {total_dist:.1f}mm")
+        return True, None
         
-        max_attempts = 3
-        
-        for attempt in range(max_attempts):
-            print(f"🔧 MOVEMENT ATTEMPT {attempt + 1}/{max_attempts}")
-            
-            try:
-                print("🚀 ATTEMPTING DIRECT MOVE...")
-                dobot.move_to(x, y, z, r, wait=True)
-                time.sleep(0.5)
-                
-                new_pose = dobot.pose()
-                new_x, new_y, new_z, new_r = new_pose[0], new_pose[1], new_pose[2], new_pose[3]
-                
-                diff_x = abs(new_x - x)
-                diff_y = abs(new_y - y)
-                diff_z = abs(new_z - z)
-                diff_r = abs(new_r - r)
-                
-                print(f"🎯 TARGET: ({x:.1f}, {y:.1f}, {z:.1f}, {r:.1f})")
-                print(f"📍 ACTUAL: ({new_x:.1f}, {new_y:.1f}, {new_z:.1f}, {new_r:.1f})")
-                
-                tolerance = 5.0
-                
-                if diff_x <= tolerance and diff_y <= tolerance and diff_z <= tolerance and diff_r <= tolerance:
-                    # NOUVEAU: Vérifier qu'on n'est pas entré en zone rouge après mouvement
-                    if check_limited_position(dobot):
-                        return False, "Mouvement réussi mais robot en zone rouge - arrêt sécurité"
-                    print("✅ DIRECT MOVE SUCCESSFUL AND VERIFIED")
-                    return True, None
-                else:
-                    print(f"⚠️ DIRECT MOVE COMPLETED BUT NOT ACCURATE (attempt {attempt + 1})")
-                    if attempt < max_attempts - 1:
-                        print("🔄 RETRYING WITH CORRECTIVE MOVE...")
-                        try:
-                            dobot.move_to(x, y, z, r, wait=True)
-                            time.sleep(0.5)
-                            
-                            final_pose = dobot.pose()
-                            final_diff_x = abs(final_pose[0] - x)
-                            final_diff_y = abs(final_pose[1] - y)
-                            final_diff_z = abs(final_pose[2] - z)
-                            final_diff_r = abs(final_pose[3] - r)
-                            
-                            if (final_diff_x <= tolerance and final_diff_y <= tolerance and 
-                                final_diff_z <= tolerance and final_diff_r <= tolerance):
-                                
-                                if check_limited_position(dobot):
-                                    return False, "Mouvement réussi mais robot en zone rouge"
-                                print("✅ CORRECTIVE MOVE SUCCESSFUL")
-                                return True, None
-                        except Exception as corrective_error:
-                            print(f"❌ CORRECTIVE MOVE FAILED: {corrective_error}")
-                    
-            except Exception as direct_error:
-                print(f"❌ DIRECT MOVE FAILED ON ATTEMPT {attempt + 1}: {direct_error}")
-                
-                if attempt < max_attempts - 1:
-                    try:
-                        print("🔧 ATTEMPTING RECOVERY STRATEGY...")
-                        
-                        safe_height = max(curr_z, z, 120)
-                        print(f"⬆️  LIFTING to safe height: {safe_height}mm")
-                        dobot.move_to(curr_x, curr_y, safe_height, curr_r, wait=True)
-                        time.sleep(0.3)
-                        
-                        print(f"➡️  HORIZONTAL MOVE to target X,Y: ({x}, {y})")
-                        dobot.move_to(x, y, safe_height, r, wait=True)
-                        time.sleep(0.3)
-                        
-                        print(f"⬇️  DESCENDING to target Z: {z}mm")
-                        dobot.move_to(x, y, z, r, wait=True)
-                        time.sleep(0.5)
-                        
-                        recovery_pose = dobot.pose()
-                        rec_diff_x = abs(recovery_pose[0] - x)
-                        rec_diff_y = abs(recovery_pose[1] - y)
-                        rec_diff_z = abs(recovery_pose[2] - z)
-                        rec_diff_r = abs(recovery_pose[3] - r)
-                        
-                        if (rec_diff_x <= tolerance and rec_diff_y <= tolerance and 
-                            rec_diff_z <= tolerance and rec_diff_r <= tolerance):
-                            
-                            if check_limited_position(dobot):
-                                return False, "Récupération réussie mais robot en zone rouge"
-                            print("✅ RECOVERY MOVE SUCCESSFUL")
-                            return True, None
-                        else:
-                            print(f"⚠️ RECOVERY MOVE COMPLETED BUT NOT ACCURATE")
-                            
-                    except Exception as recovery_error:
-                        print(f"❌ RECOVERY FAILED: {recovery_error}")
-        
-        error_message = f"Movement failed after {max_attempts} attempts"
-        print(f"❌ ALL MOVEMENT ATTEMPTS FAILED: {error_message}")
-        return False, error_message
-                
     except Exception as e:
-        error_message = f"Movement system error: {str(e)}"
-        print(f"❌ MOVEMENT SYSTEM ERROR: {error_message}")
-        return False, error_message
+        return False, f"Erreur mouvement: {str(e)}"
 
 
 def execute_trajectory_async(trajectory):
-    """Execute trajectory with PRECISE movement validation - VERSION CORRIGÉE"""
+    """Execute trajectory avec correction automatique à chaque étape"""
     global is_executing, stop_flag
     is_executing = True
     stop_flag = False
     
     try:
-        original_velocity = getattr(dobot, '_velocity', DEFAULT_VELOCITY)
-        original_acceleration = getattr(dobot, '_acceleration', DEFAULT_ACCELERATION)
-        
-        try:
-            dobot.speed(velocity=FAST_TRAJECTORY_VELOCITY, acceleration=FAST_TRAJECTORY_ACCELERATION)
-            print(f"🔥 ULTRA-HIGH SPEED MODE: {FAST_TRAJECTORY_VELOCITY}/{FAST_TRAJECTORY_ACCELERATION}")
-        except:
-            try:
-                dobot.speed(velocity=255, acceleration=255)
-                print(f"🔥 MAXIMUM HARDWARE SPEED: 255/255")
-            except:
-                pass
-        
-        print(f"🎯 Executing {len(trajectory)} steps with PRECISE positioning")
-        
-        execution_log = []
+        print(f"\n🎯 EXÉCUTION TRAJECTOIRE: {len(trajectory)} étapes")
+        print("=" * 50)
         
         for i, step in enumerate(trajectory):
             if stop_flag:
-                execution_log.append(f"🛑 Execution stopped at step {i+1}")
+                print(f"🛑 Arrêt à l'étape {i+1}")
                 break
             
-            step_log = f"Step {i+1}: "
+            step_log = f"Étape {i+1}: "
             
             if not isinstance(step, dict):
-                step_log += f"❌ Invalid step format: {type(step)}"
+                step_log += f"❌ Format invalide"
                 print(step_log)
-                execution_log.append(step_log)
                 continue
             
+            # Gripper commands
             if 'gripper' in step:
                 gripper_cmd = step['gripper']
                 if isinstance(gripper_cmd, str):
                     gripper_lower = gripper_cmd.lower().strip()
                     if gripper_lower in ['close', 'closed', '1', 'true']:
                         dobot.grip(True)
-                        step_log += "✋ Gripper CLOSED "
+                        step_log += "✋ Pince FERMÉE "
                     elif gripper_lower in ['open', 'opened', '0', 'false']:
                         dobot.grip(False)
-                        step_log += "👐 Gripper OPENED "
-                    else:
-                        step_log += f"❓ Unknown gripper command: '{gripper_cmd}' "
-                else:
-                    step_log += f"❌ Invalid gripper command type: {type(gripper_cmd)} "
-                
+                        step_log += "👐 Pince OUVERTE "
                 time.sleep(GRIPPER_OPERATION_DELAY)
             
+            # Movement commands (avec correction auto)
             movement_fields = ['x', 'y', 'z', 'r']
             has_movement = any(field in step for field in movement_fields)
             
             if has_movement:
                 try:
-                    # CORRECTION: Utiliser des valeurs par défaut SÉCURISÉES
-                    x = float(step.get('x', 50))   # Changé: 200 → 50 (rayon 50mm < 80mm)
-                    y = float(step.get('y', 0))
-                    z = float(step.get('z', 100))  # Changé: 150 → 100 (dans zone sécurisée)
-                    r = float(step.get('r', 0))
+                    x = float(step.get('x', HOME_POSITION['x']))
+                    y = float(step.get('y', HOME_POSITION['y']))
+                    z = float(step.get('z', HOME_POSITION['z']))
+                    r = float(step.get('r', HOME_POSITION['r']))
                     
-                    step_log += f"📍 Moving to ({x:.1f}, {y:.1f}, {z:.1f}, {r:.1f}) "
+                    step_log += f"📍 Déplacement vers ({x:.1f}, {y:.1f}, {z:.1f}, {r:.1f}) "
                     
                     success, error = safe_move_to(dobot, x, y, z, r, is_trajectory=True)
                     if success:
-                        step_log += "✅ SUCCESS"
+                        step_log += "✅ OK"
                     else:
-                        step_log += f"❌ FAILED: {error}"
+                        step_log += f"❌ ÉCHEC: {error}"
                         print(step_log)
-                        execution_log.append(step_log)
-                        print(f"⚠️  Arrêt de la trajectoire à l'étape {i+1} pour éviter zone rouge")
-                        break  # CORRECTION: Arrêter la trajectoire au lieu de continuer
+                        break
                         
                 except (ValueError, TypeError) as e:
-                    step_log += f"❌ COORDINATE ERROR: {e}"
+                    step_log += f"❌ ERREUR: {e}"
                     print(step_log)
-                    execution_log.append(step_log)
                     break
             
+            # Pause commands
             if 'pause' in step:
                 try:
                     pause_time = float(step['pause'])
                     if pause_time > 0:
                         actual_pause = max(MINIMUM_PAUSE_TIME, pause_time * 0.3)
-                        step_log += f"⏱️ Pausing {actual_pause:.2f}s "
+                        step_log += f"⏱️ Pause {actual_pause:.2f}s "
                         time.sleep(actual_pause)
                 except (ValueError, TypeError):
-                    step_log += "❌ Invalid pause value "
+                    step_log += "❌ Pause invalide"
             
             print(step_log)
-            execution_log.append(step_log)
         
-        print("✅ PRECISE Trajectory execution completed")
-        print(f"📝 Execution Summary: {len(execution_log)} steps processed")
+        print("=" * 50)
+        print("✅ Trajectoire terminée")
         
     except Exception as e:
-        print(f"❌ Critical error in trajectory execution: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Erreur critique: {e}")
     finally:
-        try:
-            dobot.speed(velocity=original_velocity, acceleration=original_acceleration)
-            print(f"🔧 Restored original speed: {original_velocity}/{original_acceleration}")
-        except:
-            pass
         is_executing = False
 
 
 # ============================================================================
-# FLASK ENDPOINTS - VERSION CORRIGÉE (HOME position)
+# FLASK ENDPOINTS
 # ============================================================================
 
 @app.route('/')
@@ -570,18 +380,19 @@ def index():
     """Home page"""
     ip = get_ip_address()
     return jsonify({
-        'server': 'Dobot Control Server - CORRECTED VERSION',
-        'version': '2.0',
+        'server': 'Dobot Control Server - PREVENTION TOTALE',
+        'version': '4.0',
         'ip': ip,
         'port': SERVER_PORT,
         'access': f'http://{ip}:{SERVER_PORT}',
-        'endpoints': ['/', '/status', '/network', '/manual', '/execute', '/stop'],
+        'philosophy': 'Correction automatique à la base - Pas de zone rouge',
         'safety_limits': {
             'max_radius_mm': WORKSPACE_LIMITS['max_radius'],
             'z_range_mm': WORKSPACE_LIMITS['z'],
             'r_range_deg': WORKSPACE_LIMITS['r'],
-            'based_on': 'Dobot Manual pages 14, 67, 82'
-        }
+            'home_position': HOME_POSITION
+        },
+        'endpoints': ['/', '/status', '/manual', '/execute', '/stop']
     })
 
 
@@ -589,13 +400,15 @@ def index():
 def status():
     """Status endpoint"""
     position = None
-    in_red_zone = False
+    is_safe = True
+    safety_message = "OK"
+    radius = 0
     
     if dobot:
         try:
             pose = dobot.pose()
             position = {'x': pose[0], 'y': pose[1], 'z': pose[2], 'r': pose[3]}
-            in_red_zone = check_limited_position(dobot)
+            is_safe, safety_message, radius = check_if_position_safe(pose[0], pose[1], pose[2], pose[3])
         except:
             pass
     
@@ -603,34 +416,20 @@ def status():
         'dobot_connected': dobot is not None,
         'dobot_error': connection_error,
         'position': position,
-        'in_red_zone': in_red_zone,  # NOUVEAU: indique si robot en zone rouge
+        'position_safe': is_safe,
+        'safety_message': safety_message,
+        'current_radius_mm': round(radius, 1),
         'executing': is_executing,
         'recording': is_recording,
         'server_ip': get_ip_address(),
         'server_port': SERVER_PORT,
-        'safety_active': True
-    })
-
-
-@app.route('/network')
-def network():
-    """Network info"""
-    all_ips = get_all_ips_simple()
-    return jsonify({
-        'hostname': all_ips.get('hostname'),
-        'primary_ip': all_ips.get('primary'),
-        'interfaces': {k: v for k, v in all_ips.items() 
-                      if k not in ['hostname', 'primary'] and isinstance(v, list)},
-        'server_urls': [
-            f'http://{all_ips.get("primary")}:{SERVER_PORT}',
-            'http://localhost:5000'
-        ]
+        'auto_correction': True
     })
 
 
 @app.route('/manual', methods=['POST'])
 def manual():
-    """Manual control - VERSION CORRIGÉE (HOME position sécurisée)"""
+    """Manual control avec correction automatique"""
     if not dobot:
         return jsonify({'error': 'Dobot not connected'}), 503
     
@@ -639,26 +438,34 @@ def manual():
         return jsonify({'error': 'No data'}), 400
     
     command = data.get('command')
-    params = data.get('params', {})
     
     if command == 'home':
-        # CORRECTION: Position HOME sécurisée (rayon = 50mm < 80mm)
-        # Ancienne position (200, 0, 150) était HORS ZONE (rayon 200 > 80)
-        success, error = safe_move_to(dobot, 50, 0, 100, 0)
+        success, error = safe_move_to(dobot, HOME_POSITION['x'], HOME_POSITION['y'], 
+                                     HOME_POSITION['z'], HOME_POSITION['r'])
         if success:
-            return jsonify({'success': True, 'message': 'Moved to safe home position (50, 0, 100)'})
+            return jsonify({'success': True, 'message': 'Moved to safe home position'})
         else:
             return jsonify({'error': error}), 500
     
     elif command == 'move':
-        x = float(data.get('x', 50))     # Changé: valeur par défaut sécurisée
-        y = float(data.get('y', 0))
-        z = float(data.get('z', 100))    # Changé: valeur par défaut sécurisée
-        r = float(data.get('r', 0))
+        x = float(data.get('x', HOME_POSITION['x']))
+        y = float(data.get('y', HOME_POSITION['y']))
+        z = float(data.get('z', HOME_POSITION['z']))
+        r = float(data.get('r', HOME_POSITION['r']))
         
+        # La correction est automatique dans safe_move_to
         success, error = safe_move_to(dobot, x, y, z, r)
+        
         if success:
-            return jsonify({'success': True, 'message': f'Moved to {x},{y},{z},{r}'})
+            # Vérifier si la position a été corrigée
+            x_c, y_c, z_c, r_c, corrige = validate_and_correct_position(x, y, z, r)
+            if corrige:
+                return jsonify({
+                    'success': True, 
+                    'message': f'Movement executed (auto-corrected from ({x},{y},{z},{r}) to ({x_c:.1f},{y_c:.1f},{z_c:.1f},{r_c:.1f}))'
+                })
+            else:
+                return jsonify({'success': True, 'message': f'Movement executed to ({x},{y},{z},{r})'})
         else:
             return jsonify({'error': error}), 500
     
@@ -671,6 +478,7 @@ def manual():
     elif command == 'get_position':
         try:
             pose = dobot.pose()
+            is_safe, msg, radius = check_if_position_safe(pose[0], pose[1], pose[2], pose[3])
             return jsonify({
                 'success': True,
                 'position': {
@@ -679,36 +487,18 @@ def manual():
                     'z': round(pose[2], 2),
                     'r': round(pose[3], 2)
                 },
-                'in_red_zone': check_limited_position(dobot)  # NOUVEAU
+                'radius_mm': round(radius, 1),
+                'position_safe': is_safe,
+                'safety_message': msg
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500
     
-    elif command == 'pause':
-        seconds = float(params.get('seconds', 1))
-        time.sleep(seconds)
-        return jsonify({'success': True, 'message': f'Paused for {seconds} seconds'})
-    
-    elif command == 'gripper_rotate':
-        angle = float(params.get('angle', 0))
-        try:
-            current_pose = dobot.pose()
-            new_r = current_pose[3] + angle
-            # CORRECTION: Limite selon manuel p.14 (±150°)
-            new_r = max(WORKSPACE_LIMITS['r'][0], min(WORKSPACE_LIMITS['r'][1], new_r))
-            success, error = safe_move_to(dobot, current_pose[0], current_pose[1], current_pose[2], new_r)
-            if success:
-                return jsonify({'success': True, 'message': f'Gripper rotated by {angle} degrees to {new_r} degrees'})
-            else:
-                return jsonify({'error': error}), 500
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
     elif command == 'move_relative':
-        dx = float(params.get('dx', 0))
-        dy = float(params.get('dy', 0))
-        dz = float(params.get('dz', 0))
-        dr = float(params.get('dr', 0))
+        dx = float(data.get('dx', 0))
+        dy = float(data.get('dy', 0))
+        dz = float(data.get('dz', 0))
+        dr = float(data.get('dr', 0))
         
         try:
             current_pose = dobot.pose()
@@ -719,18 +509,37 @@ def manual():
             
             success, error = safe_move_to(dobot, new_x, new_y, new_z, new_r)
             if success:
-                return jsonify({'success': True, 'message': f'Moved by ({dx},{dy},{dz},{dr}) to ({new_x:.1f},{new_y:.1f},{new_z:.1f},{new_r:.1f})'})
+                return jsonify({'success': True, 'message': f'Relative movement executed'})
             else:
                 return jsonify({'error': error}), 500
         except Exception as e:
             return jsonify({'error': str(e)}), 500
+    
+    elif command == 'check_position':
+        x = float(data.get('x', 0))
+        y = float(data.get('y', 0))
+        z = float(data.get('z', 0))
+        r = float(data.get('r', 0))
+        
+        est_safe, message, radius = check_if_position_safe(x, y, z, r)
+        x_c, y_c, z_c, r_c, corrige = validate_and_correct_position(x, y, z, r)
+        
+        return jsonify({
+            'success': True,
+            'requested': {'x': x, 'y': y, 'z': z, 'r': r},
+            'is_safe': est_safe,
+            'safety_message': message,
+            'radius_mm': round(radius, 1),
+            'auto_corrected': corrige,
+            'corrected_position': {'x': round(x_c, 1), 'y': round(y_c, 1), 'z': round(z_c, 1), 'r': round(r_c, 1)} if corrige else None
+        })
     
     return jsonify({'error': f'Unknown command: {command}'}), 400
 
 
 @app.route('/execute', methods=['POST'])
 def execute():
-    """Execute trajectory with speed optimization - Enhanced for scenario support"""
+    """Execute trajectory"""
     global is_executing
     
     if is_executing:
@@ -745,33 +554,10 @@ def execute():
     
     trajectory = data['trajectory']
     
-    client_ip = request.environ.get('REMOTE_ADDR', 'unknown')
-    user_agent = request.headers.get('User-Agent', 'unknown')
-    
-    print(f"🎯 SCENARIO EXECUTION REQUEST")
-    print(f"   Client IP: {client_ip}")
-    print(f"   User Agent: {user_agent}")
-    print(f"   Trajectory Steps: {len(trajectory)}")
-    
     if not isinstance(trajectory, list):
-        return jsonify({'error': 'Trajectory must be a list of steps'}), 400
+        return jsonify({'error': 'Trajectory must be a list'}), 400
     
-    print("   First 3 steps:")
-    for i, step in enumerate(trajectory[:3]):
-        if isinstance(step, dict):
-            coords = []
-            if 'x' in step: coords.append(f"X={step['x']}")
-            if 'y' in step: coords.append(f"Y={step['y']}")
-            if 'z' in step: coords.append(f"Z={step['z']}")
-            if 'r' in step: coords.append(f"R={step['r']}")
-            if 'gripper' in step: coords.append(f"Gripper={step['gripper']}")
-            if 'pause' in step: coords.append(f"Pause={step['pause']}s")
-            print(f"     Step {i+1}: {', '.join(coords) if coords else 'Empty step'}")
-        else:
-            print(f"     Step {i+1}: Invalid format ({type(step)})")
-    
-    if len(trajectory) > 3:
-        print(f"     ... and {len(trajectory) - 3} more steps")
+    print(f"\n🎯 RÉCEPTION TRAJECTOIRE: {len(trajectory)} étapes")
     
     thread = threading.Thread(target=execute_trajectory_async, args=(trajectory,))
     thread.daemon = True
@@ -779,114 +565,9 @@ def execute():
     
     return jsonify({
         'success': True,
-        'message': f'Scenario trajectory execution started: {len(trajectory)} steps',
+        'message': f'Trajectory started: {len(trajectory)} steps',
         'steps': len(trajectory),
-        'client_info': {
-            'ip': client_ip,
-            'user_agent': user_agent
-        },
-        'speed_profile': {
-            'velocity': FAST_TRAJECTORY_VELOCITY,
-            'acceleration': FAST_TRAJECTORY_ACCELERATION,
-            'mode': 'SCENARIO_HIGH_SPEED'
-        },
-        'execution_id': f"exec_{int(time.time())}"
-    })
-
-
-@app.route('/scenario/execute', methods=['POST'])
-def execute_scenario():
-    """Dedicated endpoint for scenario execution with enhanced logging"""
-    global is_executing
-
-    if is_executing:
-        return jsonify({'error': 'Already executing'}), 400
-
-    if not dobot:
-        return jsonify({'error': 'Dobot not connected'}), 503
-
-    data = request.json
-    if not data:
-        return jsonify({'error': 'No data provided'}), 400
-
-    trajectory = data.get('trajectory') or data.get('trajectory_data')
-    scenario_name = data.get('scenario_name', 'Unnamed Scenario')
-    scenario_id = data.get('scenario_id', 'unknown')
-
-    if not trajectory:
-        return jsonify({'error': 'No trajectory data provided'}), 400
-
-    client_ip = request.environ.get('REMOTE_ADDR', 'unknown')
-    user_agent = request.headers.get('User-Agent', 'unknown')
-
-    print(f"🎯 SCENARIO EXECUTION: {scenario_name} (ID: {scenario_id})")
-    print(f"   Client IP: {client_ip}")
-    print(f"   User Agent: {user_agent}")
-    print(f"   Trajectory Steps: {len(trajectory)}")
-
-    if not isinstance(trajectory, list):
-        return jsonify({'error': 'Trajectory must be a list of steps'}), 400
-
-    print("   First 3 steps:")
-    for i, step in enumerate(trajectory[:3]):
-        if isinstance(step, dict):
-            coords = []
-            if 'x' in step: coords.append(f"X={step['x']}")
-            if 'y' in step: coords.append(f"Y={step['y']}")
-            if 'z' in step: coords.append(f"Z={step['z']}")
-            if 'r' in step: coords.append(f"R={step['r']}")
-            if 'gripper' in step: coords.append(f"Gripper={step['gripper']}")
-            if 'pause' in step: coords.append(f"Pause={step['pause']}s")
-            print(f"     Step {i+1}: {', '.join(coords) if coords else 'Empty step'}")
-        else:
-            print(f"     Step {i+1}: Invalid format ({type(step)})")
-
-    if len(trajectory) > 3:
-        print(f"     ... and {len(trajectory) - 3} more steps")
-
-    thread = threading.Thread(target=execute_trajectory_async, args=(trajectory,))
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({
-        'success': True,
-        'message': f'Scenario "{scenario_name}" execution started successfully',
-        'scenario_name': scenario_name,
-        'scenario_id': scenario_id,
-        'steps': len(trajectory),
-        'client_info': {
-            'ip': client_ip,
-            'user_agent': user_agent
-        },
-        'speed_profile': {
-            'velocity': FAST_TRAJECTORY_VELOCITY,
-            'acceleration': FAST_TRAJECTORY_ACCELERATION,
-            'mode': 'SCENARIO_ULTRA_HIGH_SPEED'
-        },
-        'execution_id': f"scenario_exec_{int(time.time())}"
-    })
-
-
-@app.route('/record/start', methods=['POST'])
-def start_record():
-    """Start recording"""
-    global is_recording, recorded_trajectory
-    is_recording = True
-    recorded_trajectory = []
-    return jsonify({'success': True, 'message': 'Recording started'})
-
-
-@app.route('/record/stop', methods=['POST'])
-def stop_record():
-    """Stop recording"""
-    global is_recording, recorded_trajectory
-    is_recording = False
-    trajectory = recorded_trajectory.copy()
-    recorded_trajectory = []
-    return jsonify({
-        'success': True,
-        'message': f'Recorded {len(trajectory)} steps',
-        'trajectory': trajectory
+        'auto_correction': True
     })
 
 
@@ -904,6 +585,7 @@ def health():
     return jsonify({
         'status': 'healthy',
         'dobot': 'connected' if dobot else 'disconnected',
+        'auto_correction': True,
         'timestamp': datetime.now().isoformat()
     })
 
@@ -916,40 +598,42 @@ if __name__ == '__main__':
     os.system('clear')
     
     print("\n" + "="*60)
-    print("🤖 DOBOT MAGICIAN CONTROL SERVER - CORRECTED VERSION")
+    print("🤖 DOBOT CONTROL SERVER - PRÉVENTION TOTALE")
     print("="*60)
-    print("\n📖 CORRECTIONS APPLIQUÉES (basées manuel Dobot):")
-    print("   1. Rayon max: 340mm → 80mm (manuel p.67, p.82)")
-    print("   2. Z min: -100mm → 0mm (manuel p.67, p.82)")
-    print("   3. Rotation outil: ±180° → ±150° (manuel p.14)")
-    print("   4. HOME position: (200,0,150) → (50,0,100) (rayon 50mm < 80mm)")
-    print("   5. Validation OBLIGATOIRE des positions avant mouvement")
-    print("   6. Détection zone rouge avant/après chaque mouvement")
+    print("\n📖 PHILOSOPHIE:")
+    print("   ✅ Correction automatique des positions dangereuses")
+    print("   ✅ Le robot n'entre JAMAIS en zone rouge")
+    print("   ✅ Tous les mouvements sont exécutés (corrigés si besoin)")
+    print("\n🔒 LIMITES (manuel Dobot p.14,67,82):")
+    print(f"   • Rayon maximum: {WORKSPACE_LIMITS['max_radius']}mm")
+    print(f"   • Z: {WORKSPACE_LIMITS['z'][0]}-{WORKSPACE_LIMITS['z'][1]}mm")
+    print(f"   • Rotation outil: ±{WORKSPACE_LIMITS['r'][1]}°")
+    print(f"   • HOME: ({HOME_POSITION['x']}, {HOME_POSITION['y']}, {HOME_POSITION['z']})")
     print("="*60)
     
-    print_simple_network_info()
+    print_network_info()
     
     init_dobot()
     
     print("\n" + "="*60)
-    print("🚀 STARTING SERVER")
+    print("🚀 SERVEUR DÉMARRÉ")
     print("="*60)
-    print(f"   Server will start on port {SERVER_PORT}")
-    print("   Press Ctrl+C to stop\n")
+    print(f"   URL: http://{get_ip_address()}:{SERVER_PORT}")
+    print("   Ctrl+C pour arrêter\n")
     
     try:
         app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
-        print("\n👋 Server stopped")
+        print("\n👋 Arrêt du serveur")
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n❌ Erreur: {e}")
     finally:
         if dobot:
-            print("\n🔧 Returning to safe home position...")
+            print("\n🔧 Retour à la position HOME...")
             try:
-                # Utiliser la position HOME sécurisée (50, 0, 100)
-                safe_move_to(dobot, 50, 0, 100, 0)
-                print("✅ Cleanup done")
+                safe_move_to(dobot, HOME_POSITION['x'], HOME_POSITION['y'], 
+                           HOME_POSITION['z'], HOME_POSITION['r'])
+                print("✅ Nettoyage terminé")
             except:
-                print("⚠️ Cleanup failed")
-        print("\n👋 Goodbye!\n")
+                print("⚠️ Nettoyage échoué")
+        print("\n👋 Au revoir!\n")
