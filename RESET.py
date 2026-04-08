@@ -1,59 +1,78 @@
 #!/usr/bin/env python3
 """
-DOBOT HARD RESET - Reset matériel réel via relais GPIO
+DOBOT HARD RESET COMPLET + TEST RELAIS
 """
 
 from pydobot import Dobot
+import RPi.GPIO as GPIO
 import time
 import sys
-import RPi.GPIO as GPIO
 
+# ===============================
+# CONFIGURATION
+# ===============================
 PORT = '/dev/ttyUSB0'
-RELAY_PIN = 17  # GPIO17
+RELAY_PIN = 17   # GPIO utilisé
+RELAY_ON = GPIO.HIGH   # ⚠️ à adapter si besoin
+RELAY_OFF = GPIO.LOW
 
 # ===============================
-# 🔌 HARD RESET (VRAI)
+# INITIALISATION GPIO
 # ===============================
-def power_cycle_dobot():
-    """Coupe réellement l'alimentation du DOBOT"""
-    
-    print("⚡ HARD RESET (coupure alimentation)...")
-    
+def init_gpio():
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(RELAY_PIN, GPIO.OUT)
 
+# ===============================
+# TEST RELAIS (DEBUG HARDWARE)
+# ===============================
+def test_relay():
+    print("\n🧪 TEST RELAIS (regarde la LED + DOBOT)")
+    
+    for i in range(3):
+        print(f"Cycle {i+1} → ON")
+        GPIO.output(RELAY_PIN, RELAY_ON)
+        time.sleep(2)
+
+        print(f"Cycle {i+1} → OFF")
+        GPIO.output(RELAY_PIN, RELAY_OFF)
+        time.sleep(2)
+
+    print("✅ Test relais terminé\n")
+
+# ===============================
+# HARD RESET (VRAI)
+# ===============================
+def power_cycle_dobot():
+    print("⚡ HARD RESET (coupure réelle)...")
+
     try:
-        # ⚠️ Adapter selon ton relais (HIGH/LOW)
-        
-        print("🔴 OFF (coupure)")
-        GPIO.output(RELAY_PIN, GPIO.LOW)
-        time.sleep(3)
+        # OFF
+        print("🔴 OFF (robot doit s’éteindre)")
+        GPIO.output(RELAY_PIN, RELAY_OFF)
+        time.sleep(4)
 
-        print("🟢 ON (redémarrage)")
-        GPIO.output(RELAY_PIN, GPIO.HIGH)
-        time.sleep(5)
+        # ON
+        print("🟢 ON (robot doit redémarrer)")
+        GPIO.output(RELAY_PIN, RELAY_ON)
+        time.sleep(6)
 
-        print("✅ Alimentation restaurée")
+        print("✅ Power cycle terminé")
         return True
 
     except Exception as e:
         print(f"❌ Erreur relais: {e}")
         return False
 
-    finally:
-        GPIO.cleanup()
-
-
 # ===============================
-# 🤖 RECOVERY COMPLET
+# RECOVERY DOBOT
 # ===============================
-def force_unlock_with_hard_reset():
-    
+def reset_and_recover():
     print("\n" + "="*50)
-    print("🔧 DOBOT HARD RESET RECOVERY (REAL)")
+    print("🔧 DOBOT HARD RESET SYSTEM")
     print("="*50)
-    
-    # 1. Lire position avant
+
+    # 1. Lire position
     try:
         dobot = Dobot(port=PORT, verbose=False)
         pose = dobot.pose()
@@ -66,40 +85,49 @@ def force_unlock_with_hard_reset():
     if not power_cycle_dobot():
         return False
 
-    time.sleep(2)
+    time.sleep(3)
 
     # 3. Reconnexion
     try:
         dobot = Dobot(port=PORT, verbose=False)
         print("✅ Reconnexion OK")
 
-        # 4. Mouvement de recovery
-        print("📍 Move vers position safe...")
+        # 4. Mouvement test
+        print("📍 Mouvement test...")
         dobot.move_to(200, 0, 150, 0, wait=True)
-        time.sleep(1)
 
         pose = dobot.pose()
         print(f"📍 Après: X={pose[0]:.1f}, Y={pose[1]:.1f}, Z={pose[2]:.1f}")
 
-        if abs(pose[0] - 200) < 50:
-            print("🎉 Robot débloqué")
-            return True
-        else:
-            print("⚠️ Toujours bloqué")
-            return False
+        print("🎉 Test terminé")
+        return True
 
     except Exception as e:
-        print(f"❌ Erreur reconnexion: {e}")
+        print(f"❌ Erreur DOBOT: {e}")
         return False
 
-
 # ===============================
-# 🚀 MAIN
+# MAIN
 # ===============================
 if __name__ == "__main__":
-    
-    if force_unlock_with_hard_reset():
-        sys.exit(0)
-    else:
-        print("\n❌ Intervention manuelle nécessaire")
-        sys.exit(1)
+
+    init_gpio()
+
+    print("\nChoix du mode :")
+    print("1 → Test RELAIS seulement")
+    print("2 → HARD RESET DOBOT complet")
+
+    choice = input("👉 Ton choix: ")
+
+    try:
+        if choice == "1":
+            test_relay()
+
+        elif choice == "2":
+            reset_and_recover()
+
+        else:
+            print("❌ Choix invalide")
+
+    finally:
+        GPIO.cleanup()
